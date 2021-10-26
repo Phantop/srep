@@ -1,0 +1,375 @@
+SREP 3.94 plan
+  transpose the index table to increase the compression ratio
+  -m5: incremental SliceHash (i-th bit depends on the first 32 * i bytes) with two elements per chunk - for top-down and bottom-up checks
+  options -datafile (similar to -index); -write0s (write zeros to datafile instead of skipping matches); -basefile (for generating patches); -non-buffered (disable buffering in CreateFile)
+    A mode in which duplicate blocks are not thrown away, but reset to zero, and all control information is saved in a separate file
+  the -t option for automatic testing of the archive immediately after packing (implementation: either class methods or for mode = COMPRESS, DECOMPRESS) {if (mode == COMPRESS or COMPRESS_AND_TEST) ...; if (mode == DECOMPRESS or COMPRESS_AND_TEST) ...;}
+  highlight modules: cmd_parse cmd_compress cmd_decompress
+
+SREP 4.0 plan
+  Index-LZ: when unpacking, read matches in portions of 8 MB (-b bytes)
+  support -b> 8m on decompression without need to specify -b option
+  bg_thread: start separate threads for reading, writing, prepare, inmem.prepare, inmem.compress, compress / compress_cdc
+    we pass Jobs between them or use semaphores that allow processing the next buffer in order
+    BUFFERS = 2 to 4 depending on; and even more to smooth out the fast processing of some blocks
+    BUFFERS = min (-t, dictsize / bufsize), it is also equal to the number of subtracted. threads in bg_thread that process universal. Jobs; +1/2 streams for I / O
+    uint32 need_work_flags, work_done_flags, need_work_blocks [32], done_work_blocks [32] per BUFFER; Semaphore JobsToDo == Event + int? CritSection around vars
+  inmem.compress: match_dist <Barrier? len <MINLEN1: len <MINLEN2
+  Future-LZ / Index-LZ: do not store duplicate data in the dictionary, instead supply each data block with an applicability counter
+  Index-LZ: store block headers at the end of the archive, store vhash from all service data at the end of the archive
+  -i: do more checks that the file is not corrupted
+  -hash = sha256 for skylake / armv8 (plus intel code for x64); crc32 / 32c / 64 for a superficial check requiring a minimum of code inside FreeArc
+
+SREP 4.1 plan
+  compress (): if input_match and match partially overlap, trim one of them (the farther is better)
+    before recording a match, check the alternative and choose the closer one for the general area or completely remove the more distant one if it has become shorter as a result of trimming min_match
+  -m1 / m2 (as well as -m3..5): expand the match with adjacent bytes if it is within the dictionary (accordingly, do not reset the size of the dictionary during CDC, but also do not call inmem.compress; plus correct printing of dictionary compression settings)
+  -m1 / m2: merge adjacent chunks into longer matches (now each chunk is registered as a separate match)
+  -mmap support for dict> 0
+  multi-pass, f.e. -m2: l4k + m0: lc64 + tempfile + m5: l512
+    two separate passes with -m3f and dict> 0 to save memory: on the first we collect close matches, on the second distant
+  sse2 umac-64 in 32-bit version
+  splitting arrays into several parts to combat memory fragmentation, and an arbitrary size of a large hash (not necessarily a power of 2)
+    SlicedArray class (use only in win / x86 because x64 doesn't have memory fragmentation and on linux malloc will leave unused bytes - may be we need sbrk?)
+  replace all new with malloc, checking if their allocation was successful
+  option to limit decompression memory during compression
+  special format statbuf [] to improve subsequent compression with -m1 / 2 (just chunks numbers) and -m3 / 3f -d- (rounding match_src)
+  error checking: make all printf in main thread, perform "goto cleanup" instead of error () after file open operations
+
+DictionaryCompressor:
+  improve compression in compress_inmem.cpp so that it is not inferior to compression in -m5 (use the old REP algorithm + several values ​​in the hash string)
+    hashsize = 25-50% of dictsize + multiple checks + caching of hash bits + prefetching
+  make a generic Deduplicator interface (prepare_block, compress_block, memreq, errcode) and express DictionaryCompressor <uint32 / uint64> through it
+    or compress <uint32 / uint64> / prepare <type> to optimize memory usage with dictionaries <4gb
+  hash chains for 256-byte chunks for max. compression + interface Deduplicator
+  reimplement REP using interface Deduplicator with choice of compression algos, from CDC to hash-chains
+  use Cockoo hashing for DictionaryCompressor :: hasharr?
+  prepare (): read hash1..3 at the same time; process 256kb in each of the Jobs (with L = 512)
+  REP / inmem: hash = CRC32 / 64 to improve the distribution of the least significant bits of the hash; or vhash / uhash / univ.hash as it doesn't need to be sliding
+  make prepare_buffer a template for L = 32 and 64
+
+CDC:
+  -m1: start hash checking from the first byte of STRIPE (prehash 48 bytes before the stripe if not at the bufstart)
+  -m2: 32 / size_t bits depending on L (4k / 64k), STRIPE = block_size / NumThreads
+  move chunkarr into separate class used both by CDC and non-CDC global-context classes
+  check the continuation of the found match by vhash (and insert subsequent blocks in add_hash)
+  min..len..max (and use the min / max hash to select the border?)
+  try min / max hash in range instead of hash> maxhash
+  allocate startarr [] / digestarr [] / hasharr [], say, in 4mb chunks when required (also useful for -m3 ..- m5 since it doesn't need large contiguous memory blocks)
+  store block positions more compactly (say 2-4 bytes per length plus one 8-byte starting position per 16 blocks)
+  store a 32-bit hash in chunkarr in order to compare hashes when searching without unnecessary access to RAM (or use the high-order bits of chunknum, which are always zero for a given filesize / L)
+  transfer hash search for -m1 / -m2 to g, making the structure (hash1..32 + chunknum) + (chunklen + hash128..192)
+  pass the address digest [curchunk] to add_hash, which will make it possible to search for chunks with numbers> total_chunks (but not insert them into search structures)
+  ? stripe = 3 * 5 * 7 * N
+  assembler implementation of the CRC search function in -m1 to speed up its work (target - 1.5 clock / byte)
+  5 GB / s: mmap + crc32c (asm) + lock-free queue + Yield + 1.25memacces / chunk (use higher chunkarr [] bits for hash) + prefetch + compute splitted VMAC by parts inside worker threads
+  read the universal hash of hash every 16 bytes to get additional bits of entropy
+
+-m3..m5:
+  separate function for -a0 with memory prefetch
+  compress <ACCELERATOR = XXX> - support any accelerators divisible by XXX (starting from XXX = 16. or even from XXX = 4)
+  smarter -a default / -aX handling depending on L (-a16 / 16 is better than 16/8 on vhd / 22g with -l512); -a2 / 4 - default?
+  -a0 / -a1 were pessimized in 3.90, so they can be accelerated by making separate versions of compress () - reading only one 512-byte hash
+    -a0: 64-bit hash2 only (2 * 32-bit on x86)
+    -a1: 64-bit hash == hash2 (32-bit hash + 32-bit hash2 on x86)
+    > 1: 2 * 32-bit hash2 on x86
+  crc32c for hash1 / hash2
+  hash.moveto: load 16 bytes; shuffle 4 lower bytes into 32-bit subwords of SSE register; pmul by 1, K, K ^ 2, K ^ 3; next 4 bytes mul by K ^ 4, K ^ 5, K ^ 6, K ^ 7 ...; pmul accum by K ^ 16; add them all together
+  CombinedRollingHash <crc, 32bit-mul> for x86
+  background thread for calculating hashes + prefetch from a hash table in ~ 20 forward checks
+  choose one maximum of 32 hashes inside a 512-byte block, search for one of the best of 16 hashes (memory consumption as in -a1, number of calls to RAM: 55 billion / 16 = 3.5 billion)
+      with 6 bytes / block (48 bits) in bitarr, the number of false hits is 96 times less, i.e. hits to hasharr - 35M false + 7M true
+  hasharr + = chunkarr (reduce mem accesses). alternatively: search first in hasharr, indexed by hash + hash2. once hasharr [i] == hash2 found, read chunkarr [i]
+  after finding match, it is possible to calculate the sha1 of several blocks ahead in parallel, since a typical match has a length of about 10 blocks
+     (or after the verified match length has exceeded for example 4 * L, can also be compared with the last one to three blocks for simple repeating patterns)
+  add_hash / mark_match_possibility - do only prefetch with actual execution in the next L loop (4% speedup)
+  before starting to process the buffer, insert all its 512-byte blocks into the hash without deleting the previous entries (new ones will be at the end of the hash chains);
+     then you can split the buffer into 8 parts and search for matches in them in parallel; moreover, insertion into the hash for the * next * buffer can be done in parallel with this search
+  nullify 4 lower bits of chunkarr [] index so that we check 4 * 16 bytes == cpu cache line (and make sure that chunkarr itself is aligned at 64)
+  ? asm bitarr setting so that it uses one asm operation
+  ? replace vhash by universal hashing with fortuna-generated key-array
+  compare -l512 / 4k / 64k with slp + - to understand how much of the acceleration at large L is obtained due to the absence of TLB misses
+
+-m5:
+  1-bit hash for every L / 8 bytes (try incremental hash of 256 + 32 * i bytes) OR try "bit hashtab [32] [256]"
+  save / try multiple entries with the same 256-byte hash (-hN [x])
+  BUFSIZE = 32k / 256k / 2m (and immediately read the bytes before the match)
+  Why, after a 256-byte match, which could not be expanded to 512 bytes, refusing to check the remaining 256-byte matches in this chunk gives such a big gain in speed (and the number of false matches)? see update from 2013-07-07 00:12
+    probably because this "half-match" 256..511 bytes long has a lot of repetitions in other parts of the file: write and analyze all half-matches in any one chunk
+  overlap (plus m / t to increase I / O Queue Depth?) I / O with computations in -m4 / 5
+  -m3f: reduce memreqs by not storing sha1 hashes in memory, instead saving sha1 hashes of potential matches in the matchstream and checking them on the second pass
+  -m3f: save 256 bytes on both sides of the match to find its exact boundaries later
+  save potential match bytes (checked by 32-bit hash plus 2 * L bytes around) to the tempfiles (one tempfile per each 1/10 of match src range) and check them in second pass
+  check other blocks with the same hash, if match with the first is too short
+  -l512 -c256 results in a lot of false positives:
+    dll100 7.072.327 309.211 8.829 dll700 22.443.465 1.444.311 33.207 5g 332.911.300 13.556.124 454.055 lp2 338.343.016 26.385.285 1.447.763
+    if (k == saved_k && saved_match_len + (i-saved_i) <MIN_MATCH) return last_match_end; for -m5 - skipping hopeless matches
+
+high-level:
+  I / O via external commands with check of exit code (where it is possible to do it purely sequentially)
+  multithreaded bcj / dispack / lz4 / tor / lzma / delta compression of compressed blocks
+  use WinAPI to create VMFILE as temporary file not necessarily saved to disk
+  do not perform additional zeroing of arrays allocated through VirtualAlloc
+  use mmap for uncompressed file and / or keep a few last uncompressed blocks in memory
+    mmap only for the last gigabyte of the file - so as not to clog the memory with its contents; or just buffer the last gigabyte?
+  select mmap / read / mmap + read, summing bytes through 4k to fill the mmap buffer
+
+REP:
+  remember at the beginning of the block which pieces of data will be used, and limit their total size to the SetDecompressionMem value
+    1-pass packing and decompression with 1 compressed data stream, but still save memory when decompressing
+  save only VMAC hashes instead of dict: saving memory when packing
+
+misc:
+  Fast computation of hash> 4 bytes, for example multiplication 32 * 32-> 64, second hash of type (int [0] * C) / 2 + int [1] ....
+  -f:
+    BUG: in case of failure, repeat unpacking this block two more times, print the number of corrected errors
+    print the compressed size, taking into account the breakdown of matches that cross the block boundary
+  BUG: -m1 / -m2 / -f (de) compression may place any number of LZ matches per block, not limited to 8mb / L (now patched by using MAX_STATS_PER_BLOCK = blocksize / sizeof (STAT))
+  not too long matches (32-1024 bytes?) within short distances (64-1024 mb) should prohibit further matches <1024 bytes before their end?
+  like REP, allow to use larger MinMatchLen for small distances. example for use with lzma: 64mb:
+    - with a distance <64 mb and a match length <4 kb - we skip this data to the output (without looking for other matches in them!)
+    - with distance <64 mb and match length> 4 kb - encode
+    - with distance> 64 mb and match length> 32 bytes - encode
+  segmentation algorithm: split data into 128 kb blocks, build * full * index on 512-byte chunks, and compute amount of repeated bytes for every pair of blocks
+  Cuckoo / Hopscotch hashing: fast fetch on slow insert
+  L! = 2 ^ N: L = k * CYCLES (round up) then blocksize = 2 ^ N * L (round down)
+    digestarr [chunk] may not be filled at all! in particular, for L! = 2 ^ n
+    put into HashTable chunks split between two input blocks (situation that's almost impossible when L == 2 ^ n)
+  -m3: try to split the buffer into 2 mb chunks and process them in parallel !!!
+    if it doesn’t work - put the bitarr / chunkarr update in a separate thread
+    m4 / m5? - reading from a compressed file in different streams
+  multi-buffer optimization in prepare_block (2 GB / s as in compress_cdc); remix hash bits / use another secondary hash: universal, crc32c ...
+
+compress ():
+  ? return i = 1 + L * n; take out all processing of the last CYCLES bytes in a separate cycle; do update-then-use (maybe it will improve speed)?
+  when skipping a match, do not enter the main loop at all - do only mark_bitarr
+  always have a certain amount of data requested through prefetch, so as not to wait for their arrival - even if chunkarr prefetching requested only a couple of lines from LOOKAHEAD bytes
+    or bitarr prefetching requested too little data because last_match_end was close to i + L
+    Perhaps you need to make hashes1 / 2 circular buffers and go to the next cycle (prefetch-bitarr / prefetch-chunkarr / find_match) when the buffer runs out of space, updating bitarr / chunkarr at those moments, respectively. loops (prefetch-chunkarr / find_match) when going through i + L
+  hash1 = crc32c, hash2a = hash1 + a few bytes - enough for the initial check in chunkarr, after a match, calculate hash2b for hasharr (RollingPolynom for l> 1k; umac / universal hash otherwise)
+    move filling hasharr with hash2 values ​​to b / g thread; then, in the main thread, it remains to calculate from 77m * 512 to 2m * 64k bytes in hash2 (although for files of hundreds of gigs everything can be worse)
+    use semi-rolling hash for hash2 (updated by 4 bytes at a time, you can store 4 hashes with different least significant bits of the offset, and choose between update and moveto for a suitable hash)
+  hash1 = CRC + hash2b = universal ==> zero false positives? reduce digest from 160 to 128 bits? join hasharr with digestarr. -m5: 16-bit hash2 + 8 + 8 bit I / O accelerator?
+    hash2 is not a sliding one, but a fast calculating one (since it does not have to be used very often - 4% of all positions)
+    -hash128..224 (128 x86 default, 160 x64 default)
+  run LOOKAHEAD = 64..1024 (using 1 / 4-1 / 8 of 32kb L1 cache) with all compression methods to find optimal values ​​depending on -a / -l (wondering how to account for differences between machines? probably running with DDR3 -1333)
+  in hash.moveto add if remainder> = 8, if remainder> = 4, if remainder> = 2, if remainder> = 1 to get always [not] executable transitions instead of a loop with an unclear number of executions
+  in hash.update <N> check the option with a cycle of 2 elements
+
+Multi-threaded REP + SREP algorithm:
+  1. REP-search, saving found matches
+  2. We split the data into pieces of 64kb-1mb
+  2.1. For data not included in REP matches, look for bitarr / chunkarr / hasharr
+  2.2. At the same time, we save the data for updating bitarr / chunkarr / hasharr
+  2.3. After waiting for the completion of the processing of the previous block, we update them
+
+REP + SREP:
+  BG_COMPRESSION_THREAD: allocate all buffers in one piece and put only links to their parts in stat [i] / header [i])
+  m5: refuse to check the match via I / O if it is within dictsize! may worsen compression because h searches are more persistent than inmem
+  write many compressed blocks at once: hdd-to-hdd compression: 10% of real time spent in disk seeks (see srep-on-slow-HDD)
+
+m / t:
+  1.grab ReadLock and read the block
+  2. get from the thread before. small_index_head [] block
+  3. fill in digestarr (SHA1) and hasharr (rolling hash), update the copy of small_index_head [] and send it to the thread. block
+  4. compress the block using search in small_index_head [] and full_index, updating small_index_head []
+  5. get UpdateLock from the previous block and update full_index with rolling hashes of the block (by suspending all other threads)
+alternatively, it is stupid to use multiple threads at the same time, ignoring forward links or turning them into back links
+
+alternative m / t implementation:
+  1. To speed up sliding hash recalculation, perform calculations in advance and save in memory (one of each ACCELERATOR bytes).
+     For example, split the read 8 MB block into 64 KB chunks indexed by several background threads. Then the main stream will have only
+       check / update hash tables
+  2. To speed up memory accesses when working with hash tables, make these accesses also in background threads.
+     Then, in the main thread, this data will be "always ready" (background threads must process data in not very large blocks so that the data remains in the cache)
+
+Extremely fast algorithm (with bitarr, no content-based champions selection):
+  1. update crc32c (509 bytes) by 4/8/16 bytes (crc32c + 3 * clmul / 8 bytes), do prefetch from bitarr, remember crc32c via xmm: everything takes 1-2 clock cycles
+  2. in the next. in the loop, check the byte from bitarr, if successful, calculate the sliding 64-bit hash2 (512 bytes) and make 4-8-16 samples from hasharr (apparently crc64):
+         about a billion hits = 512 GB hashing = 20-30 seconds per 100 GB file, i.e. 1 clock cycle / 1 file byte
+  3. in the next. loop (?), compare hashes from hasharr with the upper words of the corresponding hash2, if successful, register a conditional match and find its conditional length by hash2
+  4.for the final check of the match, instead of sha1 - aes-based hashing (0.5sec / gb on calc + check, and everything is in the I / O stream)
+
+Anchor hashing problems: the offsets at which the anchor will fire are unpredictable, so the hashed blocks must either overlap, or there will be
+  stay gaps. Further SHA1 must be saved either from hashed blocks (causing the same overlaps or gaps), or their boundaries will not coincide
+  with the boundaries of the hashed blocks, as a result of which it will not be possible to check the coincidence of the hashed anchor block with the old one. The second option is probably preferable,
+  since matches don't have to be exactly L bytes, they usually take a little longer to either side.
+
+Anchor hashing:
+  the file is split into fixed blocks of 512 bytes, the "best" 256 bytes are allocated from each block (for example, with a maximum hash sum) with offset offset relative to. the beginning of the block
+  for each 256-byte block are stored: chunk (4 bytes) + hash256 (4 bytes) + offset (2-4 bytes) + hash512 (2-4 bytes)
+  when scanning a file, the "best" is selected from each 64-256 positions, similar blocks are searched for by hash256, which are fully matched by hash512
+
+Semi-anchor hashing:
+  Take K subblocks of a block of length L, each with length L-K + 1. We choose the largest C of them, or all that satisfy a certain condition (lb (K) of the most significant bits are equal to 0, etc.).
+  We enter them into bitarr. When searching, we check by bitarr only blocks of length l-K + 1 that satisfy the same condition.
+  For example, out of 32 subblocks of length L-31, enter the one with the largest hash sum. When searching, we select from each 16 blocks of length L-31 one with naib. sum and look for only him in bitarr.
+  The absence of its mark in the bitarr guarantees (?) The absence of a match (since the max. Of 16 aligned blocks must include the max. Of 32 unaligned blocks).
+Clarification:
+  We take K subblocks and calculate their hashes. Find max from the first K / 2 hashes, then from the next K / 2 hashes, etc. - total K / 2 + 1 values, most of which will match.
+  We mark them in bitarr.
+  When scanning a file, we find max out of each K / 2 hashes and check only it by bitarr.
+Alternatively:
+  Insert the maximum hash from K of length L-K + 1 into bitarr.
+  In the file, calculate the max. hash from the last K and look for it in bitarr.
+
+Further optimizations:
+  find a way to test a whole byte instead of a single bit without significant loss of prediction accuracy
+      for example, split the file into 8 pieces and check in the first piece only in the first bit, etc.
+      or in the first byte of the cycle before ACCEL set the first bit of the indexed byte, etc.: for (i = 0..ACCEL-1) bitarr [hash [j-L + i..j + i]] ~ = (1 < <i)
+        aka: mark_bitarr - mark the i% CYCLES-th bit in 1/2/4 ../ 64-bit word, check_bitarr - check (for speed) the entire word first, and then send only hash2 corresponding to the cocked bits for processing
+  find a way to increase the accuracy of prediction in the same amount of memory (for example, determine which specific ACCEL positions can be used - 15% acceleration at -a4)
+  optimize the use of bits in the hash, for example, do not use little informative least significant bits (try to exclude sha1 mismatches)
+
+
+Ideal implementation: ============================================== ================================================== ======================================
+srep_compress<N>
+  X = L-N+1  // размер "малого хеша", используемого для поиска совпадающих L-байтнх блоков с проверкой один раз на N байт
+
+  // 1. обновить hash1, сохранить его и запросить байт из bitarr
+  for (p in ptr...ptr+N)
+    обновить X-байтный 64-битный хеш hash1
+  saved_hash1[h1i++] = hash1   h1i %= 256
+  prefetch bitarr[hash1>>n]
+
+  // 2. проверить бит, ранее извлечённый из bitarr, и если он true, то запросить кеш-строки из большого хеша
+  h1 = saved_hash1[h1i]
+  if (N==0  ||  BitTest (bitarr[h1>>n], h1>>(64-3)))
+    *saved_hash2++ = ptr
+    hash2 = h1 дополненный до L-байтного хеша
+    for (p in ptr-256...ptr-256+N)
+      обновить L-байтный 64-битный хеш hash2
+      *saved_hash2++ = hash2
+      prefetch main_hash[hash2>>nn]
+
+  // 3. обновить bitarr если мы обработали последние N байт L-байтного блока
+  if (N>0  &&  (ptr-256+N) % L == 0)
+    for (p in ptr-256...ptr-256+N)
+      обновить X-байтный 64-битный хеш h1
+      BitSet (bitarr[h1>>n], h1>>(64-3))
+
+  // 4. Проверить строки из main_hash, если их префетч был сделан уже достаточно давно
+  if (N==0  ||  *read_hash2 == ptr-768)
+    for (p in ptr-768...ptr-768+N)
+      hash2 = *read_hash2++
+      for (i in 0..3)  // use SIMD
+        unt32 h := main_hash[hash2>>nn+i]
+        if (h==uint32(hash2))  // match found, check sha1
+        if (h==0) break
+
+  // 5. Обновить main_hash
+  if ((ptr-768+N) % L == 0)
+
+
+Идеально жмущий алгоритм для -m3..5: ========================================================================================================================
+  hash1 = crc<size_t> от L-N+1 байта для проверки bitarr[]
+  hash2 = crc64 от N байт для проверки chunkarr/hasharr (32-битный индекс в chunkarr + 32-битное значение, хранимое в hasharr)
+  for each L-byte block
+    // Part 1: prefetch bitarr[]
+    for (i=0; i<L-N; i+=N)
+      prefetch bitarr[hash1]
+      *hash1p++ = hash1
+      for (j=0; j<N; j++)
+        hash1.update()
+        *hash2p++ = hash2
+        hash2.update()      // storing hash2 for the case of successful bitarr[] probe
+
+    i=L-N
+      for (j=0; j<N; j++)
+        prefetch bitarr[hash1]
+        *hash1p++ = hash1    // storing hash1 for the bitarr[] update
+        hash1.update()
+        *hash2p++ = hash2
+        hash2.update()
+
+    // Part 2: check bitarr[] & prefetch chunkarr[]
+    for (i=0; i<L; i+=N)
+      hash1 = *hash1p++
+      if bitarr[hash1]
+        for (j=0; j<N; j++)
+          hash2 = *hash2p++
+          *cptr++ = hash2
+          prefetch chunkarr[hash2]
+
+    // Part 3: update bitarr[]
+    for (i=L-N; i<L; i++)
+      bitarr[hash1] = 1
+      hash1 = *hash1p++
+
+    // Part 4: check chunkarr[] - ideally, it should check the data prefetched in the previous block in order to completely hide any memory delays
+    for (*p=cbuf; p<cptr; p++)
+      hash2 = *p++
+      if hasharr[chunkarr[hash2]]==hash2
+        match found!
+
+    // Part 5: update chunkarr[]
+    chunkarr[hash2] = chunk
+    hasharr[chunk++] = hash2
+
+Skipping match that covers the entire L-byte block: =========================================================================================================
+    hash1.moveto(L-N+1); hash2.moveto(L)   // may be performed simultaneously in order to hide delays
+    prefetch chunkarr[]
+    update bitarr[]
+    update chunkarr[]
+
+N=0 (-a0): ==================================================================================================================================================
+    // prefetch chunkarr[]
+    for (i=0; i<L; i++)
+      prefetch chunkarr[hash2]
+      *cptr++ = hash2
+      hash2.update()
+
+    // check chunkarr[]
+    for (*p=cbuf; p<cptr; p++)
+      hash2 = *p++
+      if hasharr[chunkarr[hash2]]==hash2
+        match found!
+
+    // update chunkarr[]
+    chunkarr[hash2] = chunk
+    hasharr[chunk++] = hash2
+
+Имея 64-битный мультипликативный hash, можно использовать hash_hi+hash_lo и hash_hi-hash_lo как независимые 32-битные более-менее хорошо распределённые величины.
+А также hash+hash_hi как 64-битную с приличным распределением. В 32-битном коде можно использовать две crc32c с разными стартовыми значениями для получения
+двух 32-битный хешей. Возможно, циклы вокруг каждого пункта (выполнить 4 раза пункт 1, затем 4 раза пункт 2 и т.д.) ускорят работу
+PolynomialRollingHash::moveto() может использовать SSE2/AVX2 для умножения на степени K и сложения полученных результатов:
+  2*127(63)+10 тактов на 512 байт с SSE2(AVX2)
+CrcRollingHash::moveto() может считать CRC от нескольких частей буфера параллельно и затем комбинировать их
+
+
+Быстрая версия старого (лучше жмущего) алгоритма REP - ожидаемая скорость ~500MB/s в однопоточном режиме:
+  for (i=0; i<32*a; i++)      // `a` is a value of -da option
+    prefetch hash
+    *saved_hash++ = hash
+    update_rolling_hash()
+  for (; i%32; i++)
+    update_rolling_hash()
+  for (; i<256; i+=32)
+    prefetch hash
+    *saved_hash++ = hash
+    for (j=0; i<32; j++)
+      update_rolling_hash();
+  for (i=0; i<32*a; i++)
+    hash = *saved_hash++
+    проверить 4/8 значений, извлечённых их хеш-таблицы (8-байтные значения, содержащие индекс блока и до 32 бит его хеша)
+  for (i=0; i<256; i+=32)
+    hash = *saved_hash++
+    добавить в хеш-таблицу этот блок данных, сдвинув предыдущие значения в строке назад
+
+
+Быстрый алгоритм для REP, аналог srep:m4 при 512-byte block; аналог m5 при 256-byte block
+  for each 512-byte block
+    for (i=0; i<512; i+=16)
+      поискать в хеше (512-15)-байтный блок начинающийся с ptr+i
+    for (i=0; i<16; i++)
+      вставить в хеш (512-15)-байтный блок начинающийся с ptr+512-16+i
+  8-байтный хеш: 4 байта используется для адресации hasharr[], а другие 4 байта сохраняются в hasharr[] для быстрой проверки матча
+  для ускорения работы пускать в 2 цикла - в первом делать префетч, во втором фактический поиск/обновление hasharr[]
+  если last_match_end > ptr+512-16, то пускать упрощённый цикл - сразу c hash.moveto(ptr+512-16) и последующим обновлением hasharr[]
+  4-8 значений в каждой хеш-строке
+
+
+Patch system (-base:filename)
+  виртуальный входной файл, состоящий из двух, для упаковки (read+read) и распаковки (read+rw), вирт. размер = сумме размеров двух файлов
+  compress(... last_match_end)
+  при записи сжатых данных - игнорируем блоки до начала второго файла и литеральные байты из общего блока, принадлежащие первому файлу
